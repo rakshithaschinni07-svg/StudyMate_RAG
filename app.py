@@ -3,6 +3,7 @@ import re
 import hashlib
 import json
 import numpy as np
+import os
 
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
@@ -79,7 +80,7 @@ st.markdown(
 # GEMINI
 # =========================================================
 
-GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 client = genai.Client(
     api_key=GEMINI_API_KEY
