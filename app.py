@@ -2,74 +2,61 @@ import streamlit as st
 import re
 import hashlib
 import json
-import numpy as np
+import math
 import os
+from collections import Counter
 
 from pypdf import PdfReader
-from sentence_transformers import SentenceTransformer
 from google import genai
 
 
 # =========================================================
-# PAGE CONFIG
+# PAGE CONFIGURATION
 # =========================================================
 
 st.set_page_config(
     page_title="StudyMate RAG",
     page_icon="📚",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
 
 # =========================================================
-# SIMPLE CSS
+# CUSTOM CSS
 # =========================================================
 
 st.markdown(
     """
     <style>
-
     .main-title {
         font-size: 42px;
         font-weight: 800;
-        color: #ffffff;
-        margin-bottom: 5px;
+        margin-bottom: 0px;
     }
 
-    .sub-title {
-        font-size: 17px;
-        color: #cbd5e1;
+    .subtitle {
+        font-size: 18px;
+        color: #666;
         margin-bottom: 20px;
     }
 
-    .pdf-card {
-        background-color: #ffffff;
-        color: #111827;
-        border: 1px solid #cbd5e1;
+    .info-card {
+        padding: 18px;
         border-radius: 12px;
-        padding: 16px;
-        margin: 15px 0;
+        background-color: #f5f7fb;
+        border: 1px solid #e1e5ee;
+        margin-bottom: 15px;
+        color : #222;
     }
 
     .source-card {
-        background-color: #f8fafc;
-        color: #111827;
-        border: 1px solid #cbd5e1;
-        border-radius: 12px;
         padding: 15px;
-        margin: 10px 0;
+        border-radius: 10px;
+        background-color: #f8f9fa;
+        border-left: 4px solid #4CAF50;
+        margin-top: 10px;
+        color : #222;
     }
-
-    .score-card {
-        background-color: #172554;
-        color: #ffffff;
-        border-radius: 15px;
-        padding: 25px;
-        text-align: center;
-        margin: 20px 0;
-    }
-
     </style>
     """,
     unsafe_allow_html=True
@@ -77,31 +64,18 @@ st.markdown(
 
 
 # =========================================================
-# GEMINI
+# GEMINI SETUP
 # =========================================================
 
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-client = genai.Client(
-    api_key=GEMINI_API_KEY
-)
+if not GEMINI_API_KEY:
+    st.error("GEMINI_API_KEY is not configured.")
+    st.stop()
+
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 MODEL_NAME = "gemini-3.5-flash-lite"
-
-
-# =========================================================
-# EMBEDDING MODEL
-# =========================================================
-
-@st.cache_resource
-def load_embedding_model():
-
-    return SentenceTransformer(
-        "all-MiniLM-L6-v2"
-    )
-
-
-embedding_model = load_embedding_model()
 
 
 # =========================================================
@@ -135,16 +109,12 @@ if "quiz_previous_questions" not in st.session_state:
 if "quiz_pdf_id" not in st.session_state:
     st.session_state.quiz_pdf_id = None
 
-if "quiz_history_saved" not in st.session_state:
-    st.session_state.quiz_history_saved = False
-
 
 # =========================================================
 # HISTORY
 # =========================================================
 
 def add_history(activity_type, title, content):
-
     st.session_state.study_history.append(
         {
             "type": activity_type,
@@ -155,11 +125,10 @@ def add_history(activity_type, title, content):
 
 
 # =========================================================
-# RESET QUIZ
+# QUIZ RESET
 # =========================================================
 
 def reset_quiz():
-
     st.session_state.quiz_questions = []
     st.session_state.quiz_current_index = 0
     st.session_state.quiz_score = 0
@@ -167,43 +136,35 @@ def reset_quiz():
     st.session_state.quiz_selected_answer = None
     st.session_state.quiz_round = 0
     st.session_state.quiz_previous_questions = []
-    st.session_state.quiz_history_saved = False
 
 
 # =========================================================
-# PDF EXTRACTION
+# PDF TEXT EXTRACTION
 # =========================================================
 
 def extract_text_from_pdf(uploaded_file):
 
     reader = PdfReader(uploaded_file)
 
-    pages = []
+    full_text = ""
 
     for page in reader.pages:
 
-        text = page.extract_text()
+        page_text = page.extract_text()
 
-        if text:
-            pages.append(text)
+        if page_text:
+            full_text += page_text + "\n\n"
 
-    return "\n\n".join(pages), len(reader.pages)
+    return full_text
 
 
 # =========================================================
-# CHUNKING
+# PARAGRAPH-AWARE CHUNKING
 # =========================================================
 
-def create_chunks(
-    text,
-    max_chars=1200,
-    overlap_paragraphs=1
-):
+def create_chunks(text, max_chars=1200, overlap_paragraphs=1):
 
-    paragraphs = re.split(
-        r"\n\s*\n",
-        text
-    )
+    paragraphs = re.split(r"\n\s*\n", text)
 
     paragraphs = [
         paragraph.strip()
@@ -212,109 +173,288 @@ def create_chunks(
     ]
 
     chunks = []
-
     current_chunk = []
 
     for paragraph in paragraphs:
 
-        current_text = "\n\n".join(
-            current_chunk
-        )
+        current_text = "\n\n".join(current_chunk)
 
         if (
             current_chunk
-            and
-            len(current_text) + len(paragraph)
-            > max_chars
+            and len(current_text) + len(paragraph) > max_chars
         ):
 
             chunks.append(current_text)
 
-            current_chunk = current_chunk[
-                -overlap_paragraphs:
-            ]
+            current_chunk = current_chunk[-overlap_paragraphs:]
 
         current_chunk.append(paragraph)
 
     if current_chunk:
-
-        chunks.append(
-            "\n\n".join(current_chunk)
-        )
+        chunks.append("\n\n".join(current_chunk))
 
     return chunks
 
 
 # =========================================================
-# EMBEDDINGS
+# LOCAL TEXT PROCESSING
 # =========================================================
 
-def create_embeddings(chunks):
+def tokenize(text):
 
-    return embedding_model.encode(
-        chunks,
-        convert_to_numpy=True
+    text = text.lower()
+
+    words = re.findall(
+        r"[a-zA-Z0-9]+",
+        text
     )
 
+    stop_words = {
+        "the",
+        "is",
+        "are",
+        "was",
+        "were",
+        "a",
+        "an",
+        "and",
+        "or",
+        "of",
+        "to",
+        "in",
+        "on",
+        "for",
+        "with",
+        "by",
+        "as",
+        "at",
+        "from",
+        "this",
+        "that",
+        "these",
+        "those",
+        "it",
+        "its",
+        "be",
+        "can",
+        "may",
+        "into",
+        "which",
+        "what",
+        "why",
+        "how",
+        "when",
+        "where",
+        "their",
+        "they",
+        "them",
+        "than",
+        "also",
+        "such"
+    }
+
+    return [
+        word
+        for word in words
+        if word not in stop_words and len(word) > 1
+    ]
+
 
 # =========================================================
-# RETRIEVAL
+# TF-IDF RETRIEVAL
 # =========================================================
+
+def create_tfidf_index(chunks):
+
+    tokenized_chunks = [
+        tokenize(chunk)
+        for chunk in chunks
+    ]
+
+    document_frequency = Counter()
+
+    for tokens in tokenized_chunks:
+
+        unique_words = set(tokens)
+
+        for word in unique_words:
+            document_frequency[word] += 1
+
+    total_documents = len(chunks)
+
+    return {
+        "tokenized_chunks": tokenized_chunks,
+        "document_frequency": document_frequency,
+        "total_documents": total_documents
+    }
+
+
+def calculate_tfidf_vector(tokens, document_frequency, total_documents):
+
+    term_frequency = Counter(tokens)
+
+    vector = {}
+
+    total_words = len(tokens)
+
+    if total_words == 0:
+        return vector
+
+    for word, count in term_frequency.items():
+
+        tf = count / total_words
+
+        df = document_frequency.get(word, 0)
+
+        if df == 0:
+            continue
+
+        idf = math.log(
+            (total_documents + 1)
+            /
+            (df + 1)
+        ) + 1
+
+        vector[word] = tf * idf
+
+    return vector
+
+
+def cosine_similarity(vector_a, vector_b):
+
+    if not vector_a or not vector_b:
+        return 0.0
+
+    common_words = set(vector_a.keys()) & set(vector_b.keys())
+
+    dot_product = sum(
+        vector_a[word] * vector_b[word]
+        for word in common_words
+    )
+
+    magnitude_a = math.sqrt(
+        sum(value * value for value in vector_a.values())
+    )
+
+    magnitude_b = math.sqrt(
+        sum(value * value for value in vector_b.values())
+    )
+
+    if magnitude_a == 0 or magnitude_b == 0:
+        return 0.0
+
+    return dot_product / (magnitude_a * magnitude_b)
+
 
 def retrieve_relevant_chunks(
     question,
     chunks,
-    embeddings
+    tfidf_index,
+    top_k=5
 ):
 
-    question_embedding = embedding_model.encode(
-        [question],
-        convert_to_numpy=True
-    )[0]
+    question_tokens = tokenize(question)
 
-    similarities = np.dot(
-        embeddings,
-        question_embedding
-    ) / (
-        np.linalg.norm(
-            embeddings,
-            axis=1
-        )
-        *
-        np.linalg.norm(
-            question_embedding
-        )
-        + 1e-10
+    question_vector = calculate_tfidf_vector(
+        question_tokens,
+        tfidf_index["document_frequency"],
+        tfidf_index["total_documents"]
     )
 
-    top_indices = sorted(
-        range(len(similarities)),
-        key=lambda i: similarities[i],
-        reverse=True
-    )[:5]
+    similarities = []
 
-    results = []
+    for index, tokens in enumerate(
+        tfidf_index["tokenized_chunks"]
+    ):
 
-    for index in top_indices:
-
-        results.append(
-            {
-                "chunk": chunks[index],
-                "score": float(
-                    similarities[index]
-                ),
-                "index": index
-            }
+        chunk_vector = calculate_tfidf_vector(
+            tokens,
+            tfidf_index["document_frequency"],
+            tfidf_index["total_documents"]
         )
 
-    return results
+        similarity = cosine_similarity(
+            question_vector,
+            chunk_vector
+        )
+
+        similarities.append(
+            (index, similarity)
+        )
+
+    similarities.sort(
+        key=lambda item: item[1],
+        reverse=True
+    )
+
+    top_results = similarities[:top_k]
+
+    return [
+        {
+            "index": index,
+            "text": chunks[index],
+            "similarity": similarity
+        }
+        for index, similarity in top_results
+        if similarity > 0
+    ]
 
 
 # =========================================================
 # GEMINI RESPONSE
 # =========================================================
 
-def generate_response(prompt):
+def generate_answer(question, retrieved_chunks):
+
+    if not retrieved_chunks:
+
+        return (
+            "I could not find the answer in the uploaded notes."
+        )
+
+    context_parts = []
+
+    for item in retrieved_chunks:
+
+        context_parts.append(
+            f"""
+SOURCE CHUNK {item['index'] + 1}:
+
+{item['text']}
+"""
+        )
+
+    context = "\n".join(context_parts)
+
+    prompt = f"""
+You are StudyMate, an AI study assistant.
+
+Answer the student's question using ONLY the uploaded study material
+provided below.
+
+IMPORTANT RULES:
+
+1. Do not use outside knowledge.
+2. Do not invent information.
+3. Do not make assumptions.
+4. If the answer cannot be found in the provided material, say exactly:
+
+"I could not find the answer in the uploaded notes."
+
+5. Use simple BCA-level language.
+6. Keep the answer focused on the question.
+7. If there are multiple points, use bullet points.
+8. If the question asks for a comparison, use a clear comparison.
+9. Do not mention that you are using a retrieval system.
+
+UPLOADED STUDY MATERIAL:
+
+{context}
+
+STUDENT QUESTION:
+
+{question}
+"""
 
     response = client.models.generate_content(
         model=MODEL_NAME,
@@ -325,79 +465,36 @@ def generate_response(prompt):
 
 
 # =========================================================
-# QUESTION ANSWERING
-# =========================================================
-
-def answer_question(
-    question,
-    retrieved_chunks
-):
-
-    context = "\n\n".join(
-        [
-            f"Source {i + 1}:\n{item['chunk']}"
-            for i, item in enumerate(
-                retrieved_chunks
-            )
-        ]
-    )
-
-    prompt = f"""
-You are StudyMate, an AI study assistant.
-
-Answer the student's question using ONLY the uploaded study material.
-
-Rules:
-
-1. Use only the provided material.
-2. Do not use outside facts.
-3. Do not invent information.
-4. If the answer is not available, say:
-
-"I could not find the answer in the uploaded notes."
-
-5. Use simple BCA-level English.
-6. Use bullet points when useful.
-7. For comparisons, give a clear comparison.
-8. Stay focused on the question.
-
-QUESTION:
-
-{question}
-
-UPLOADED STUDY MATERIAL:
-
-{context}
-"""
-
-    return generate_response(prompt)
-
-
-# =========================================================
 # SUMMARY
 # =========================================================
 
 def generate_summary(full_text):
 
     prompt = f"""
-Create a simple exam-friendly summary of the uploaded study material.
+Create an exam-friendly summary of the uploaded study material.
 
-Rules:
+IMPORTANT:
 
-1. Use ONLY the uploaded material.
-2. Do not add outside information.
-3. Do not invent facts.
-4. Cover important concepts.
-5. Use simple BCA-level English.
-6. Use headings and bullet points.
-7. Include important definitions and comparisons.
+- Use ONLY the uploaded material.
+- Do not add outside information.
+- Do not invent facts.
+- Cover the important topics.
+- Use simple BCA-level English.
+- Use headings and bullet points.
+- Include important definitions and concepts.
+- Make it useful for exam revision.
 
 UPLOADED MATERIAL:
 
 {full_text}
 """
 
-    return generate_response(prompt)
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=prompt
+    )
+
+    return response.text
 
 
 # =========================================================
@@ -414,28 +511,31 @@ def generate_quiz(
     )
 
     prompt = f"""
-Create EXACTLY 5 multiple-choice questions
-from the uploaded study material.
+Create exactly 5 multiple-choice questions from the uploaded study
+material.
 
 Rules:
 
 1. Use ONLY the uploaded material.
 2. Do not use outside knowledge.
-3. Each question must have exactly 4 options.
-4. Options must be A, B, C and D.
-5. Exactly one option is correct.
-6. Give a short explanation.
-7. Use simple BCA-level English.
-8. Cover different concepts.
-9. Avoid repeating previous questions.
-10. Return ONLY valid JSON.
-11. Do not use Markdown.
+3. Do not repeat previous questions.
+4. Try to test different concepts.
+5. Each question must have exactly four options:
+   A
+   B
+   C
+   D
+6. Only one option must be correct.
+7. Include a short explanation.
+8. Questions should be suitable for a BCA student.
+9. Return ONLY valid JSON.
+10. Do not use Markdown.
 
 JSON format:
 
 [
   {{
-    "question": "Question",
+    "question": "Question text",
     "options": {{
       "A": "Option A",
       "B": "Option B",
@@ -443,7 +543,7 @@ JSON format:
       "D": "Option D"
     }},
     "correct_answer": "A",
-    "explanation": "Explanation"
+    "explanation": "Short explanation"
   }}
 ]
 
@@ -451,48 +551,70 @@ PREVIOUS QUESTIONS:
 
 {previous_text}
 
-UPLOADED MATERIAL:
+UPLOADED STUDY MATERIAL:
 
 {full_text}
 """
 
-    response = generate_response(
-        prompt
-    ).strip()
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=prompt
+    )
 
-    if response.startswith("```"):
+    raw_text = response.text.strip()
 
-        response = re.sub(
-            r"^```(?:json)?",
-            "",
-            response
-        )
+    raw_text = re.sub(
+        r"^```json\s*",
+        "",
+        raw_text
+    )
 
-        response = re.sub(
-            r"```$",
-            "",
-            response
-        )
+    raw_text = re.sub(
+        r"\s*```$",
+        "",
+        raw_text
+    )
 
-    data = json.loads(response)
+    try:
 
-    if not isinstance(data, list):
-        raise ValueError("Invalid quiz format.")
+        questions = json.loads(raw_text)
 
-    if len(data) != 5:
-        raise ValueError(
-            "Quiz must contain exactly 5 questions."
-        )
+    except json.JSONDecodeError:
 
-    for question in data:
+        return []
 
-        if set(
-            question["options"].keys()
-        ) != {"A", "B", "C", "D"}:
+    if not isinstance(questions, list):
+        return []
 
-            raise ValueError(
-                "Invalid options."
-            )
+    if len(questions) != 5:
+        return []
+
+    valid_questions = []
+
+    for question in questions:
+
+        if not isinstance(question, dict):
+            continue
+
+        if "question" not in question:
+            continue
+
+        if "options" not in question:
+            continue
+
+        if "correct_answer" not in question:
+            continue
+
+        if "explanation" not in question:
+            continue
+
+        options = question["options"]
+
+        if not isinstance(options, dict):
+            continue
+
+        if set(options.keys()) != {"A", "B", "C", "D"}:
+            continue
 
         if question["correct_answer"] not in {
             "A",
@@ -500,12 +622,14 @@ UPLOADED MATERIAL:
             "C",
             "D"
         }:
+            continue
 
-            raise ValueError(
-                "Invalid correct answer."
-            )
+        valid_questions.append(question)
 
-    return data
+    if len(valid_questions) != 5:
+        return []
+
+    return valid_questions
 
 
 # =========================================================
@@ -518,8 +642,52 @@ def generate_topic_lesson(
     study_type
 ):
 
+    language_instruction = ""
+
+    subject_lower = subject.lower()
+
+    if "kannada" in subject_lower:
+
+        language_instruction = """
+The subject is Kannada.
+
+Write the entire answer in Kannada.
+
+Use Kannada headings and Kannada explanations.
+
+Do not write English paragraphs.
+
+English may be used only for unavoidable technical terms.
+"""
+
+    elif "hindi" in subject_lower:
+
+        language_instruction = """
+The subject is Hindi.
+
+Write the entire answer in Hindi.
+
+Use Hindi headings and Hindi explanations.
+"""
+
+    elif "english" in subject_lower:
+
+        language_instruction = """
+The subject is English.
+
+Write the answer in simple English.
+"""
+
+    else:
+
+        language_instruction = """
+This is a technical or general academic subject.
+
+Write the answer in simple English suitable for a BCA student.
+"""
+
     prompt = f"""
-You are an educational assistant helping a BCA student.
+You are an academic study assistant.
 
 Subject:
 {subject}
@@ -530,71 +698,30 @@ Topic:
 Study type:
 {study_type}
 
-LANGUAGE RULES:
+{language_instruction}
 
-If the subject is Kannada:
-- Write the entire answer in Kannada.
-- Use Kannada headings.
-- Do not write English paragraphs.
-- English technical terms may be used only when necessary.
+IMPORTANT ACCURACY RULES:
 
-If the subject is Hindi:
-- Write the entire answer in Hindi.
+1. Do not pretend that you have the student's textbook.
+2. Do not pretend that you have their syllabus.
+3. Do not invent an author, poem, story, historical context, quotation,
+or textbook-specific meaning.
+4. If this is a specific literature lesson and exact context is needed,
+clearly say that the textbook or lesson text is required.
+5. Do not invent quotations.
+6. Give only information you can provide reliably.
+7. Use simple student-friendly language.
+8. Make the answer useful for exams.
 
-If the subject is English:
-- Write in English.
-
-For technical subjects:
-- Use simple English.
-
-ACCURACY RULES:
-
-1. Do not pretend to have the student's textbook.
-2. Do not claim the answer comes from uploaded notes.
-3. Do not invent authors or quotations.
-4. Do not invent literary context.
-5. If exact textbook context is required, clearly say so.
-6. Use simple student-friendly language.
-7. Make the answer useful for exams.
-
-Now prepare the requested study material.
+Generate the requested study material.
 """
 
-    return generate_response(prompt)
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=prompt
+    )
 
-
-# =========================================================
-# HEADER
-# =========================================================
-
-st.markdown(
-    '<div class="main-title">📚 StudyMate RAG</div>',
-    unsafe_allow_html=True
-)
-
-st.markdown(
-    '<div class="sub-title">'
-    'Your AI-powered study assistant for learning from your own notes or any topic.'
-    '</div>',
-    unsafe_allow_html=True
-)
-
-
-# =========================================================
-# HERO
-# IMPORTANT: NO HTML HERE
-# =========================================================
-
-st.success(
-    "🎓 Learn smarter. Revise faster."
-)
-
-st.write(
-    "Upload your study material to ask grounded questions, "
-    "generate summaries, explore your document, and take "
-    "interactive quizzes. You can also study any topic "
-    "without a PDF."
-)
+    return response.text
 
 
 # =========================================================
@@ -603,53 +730,86 @@ st.write(
 
 with st.sidebar:
 
-    st.markdown("## 📊 Study History")
+    st.header("📚 StudyMate")
 
-    st.caption(
-        "Your recent learning activity"
-    )
+    st.divider()
 
-    if not st.session_state.study_history:
+    st.subheader("📊 Study History")
 
-        st.info(
-            "No study activity yet."
-        )
-
-    else:
+    if st.session_state.study_history:
 
         st.write(
             f"{len(st.session_state.study_history)} "
             "activities in this session"
         )
 
-        for item in reversed(
+        for activity in reversed(
             st.session_state.study_history
         ):
 
             st.write(
-                f"**{item['type']}**  \n"
-                f"{item['title']}"
+                f"{activity['type']} "
+                f"**{activity['title']}**"
             )
 
-            st.divider()
+    else:
 
-    st.markdown("## 📚 About StudyMate")
+        st.write(
+            "No study activities yet."
+        )
+
+    st.divider()
+
+    st.subheader("ℹ️ About StudyMate")
 
     st.write(
-        "StudyMate uses Retrieval-Augmented Generation "
-        "(RAG) to answer questions from your study material."
+        """
+StudyMate is an AI-powered study assistant
+that helps students learn from their own
+PDF notes and study topics.
+"""
     )
 
-    st.caption(
-        "History is stored only during the current app session."
+    st.write(
+        """
+**RAG Flow**
+
+PDF → Text → Chunks → Local Retrieval → Gemini → Answer
+"""
     )
 
 
 # =========================================================
-# MAIN MODE TABS
+# MAIN HEADER
 # =========================================================
 
-pdf_mode, topic_mode = st.tabs(
+st.markdown(
+    '<div class="main-title">📚 StudyMate RAG</div>',
+    unsafe_allow_html=True
+)
+
+st.markdown(
+    '<div class="subtitle">'
+    'Your AI-powered study assistant'
+    '</div>',
+    unsafe_allow_html=True
+)
+
+st.success(
+    "🎓 Learn smarter. Revise faster."
+)
+
+st.write(
+    "Upload your study material, ask questions, "
+    "generate summaries, practice quizzes, or study a topic without a PDF."
+)
+
+
+# =========================================================
+# TABS
+# =========================================================
+
+tab_pdf, tab_without_pdf = st.tabs(
     [
         "📄 Study From PDF",
         "📚 Study Without PDF"
@@ -658,19 +818,15 @@ pdf_mode, topic_mode = st.tabs(
 
 
 # =========================================================
-# STUDY FROM PDF
+# PDF TAB
 # =========================================================
 
-with pdf_mode:
+with tab_pdf:
 
-    st.header("📄 Study From PDF")
-
-    st.write(
-        "Upload your notes and learn directly from your study material."
-    )
+    st.subheader("📄 Upload Study Material")
 
     uploaded_file = st.file_uploader(
-        "Choose your study PDF",
+        "Upload a PDF",
         type=["pdf"]
     )
 
@@ -682,13 +838,10 @@ with pdf_mode:
             file_bytes
         ).hexdigest()
 
-        # Reset quiz when PDF changes
-
         if (
             st.session_state.quiz_pdf_id is not None
             and
-            st.session_state.quiz_pdf_id
-            != current_pdf_id
+            st.session_state.quiz_pdf_id != current_pdf_id
         ):
 
             reset_quiz()
@@ -700,516 +853,456 @@ with pdf_mode:
 
         st.session_state.quiz_pdf_id = current_pdf_id
 
-        try:
+        # -------------------------------------------------
+        # PROCESS PDF
+        # -------------------------------------------------
 
-            # -------------------------------------------------
-            # PDF
-            # -------------------------------------------------
-
-            full_text, page_count = extract_text_from_pdf(
-                uploaded_file
-            )
-
-            if not full_text.strip():
-
-                st.error(
-                    "No readable text was found in this PDF."
-                )
-
-                st.stop()
-
-            # -------------------------------------------------
-            # CHUNKS
-            # -------------------------------------------------
-
-            chunks = create_chunks(
-                full_text
-            )
-
-            # -------------------------------------------------
-            # EMBEDDINGS
-            # -------------------------------------------------
+        if (
+            "processed_pdf_id"
+            not in st.session_state
+            or
+            st.session_state.processed_pdf_id
+            != current_pdf_id
+        ):
 
             with st.spinner(
                 "Preparing your study material..."
             ):
 
-                embeddings = create_embeddings(
-                    chunks
-                )
+                try:
 
-            # -------------------------------------------------
-            # PDF INFORMATION
-            # -------------------------------------------------
-
-            st.markdown(
-                f"""
-                <div class="pdf-card">
-                    <strong>📄 {uploaded_file.name}</strong>
-                    <br><br>
-                    <strong>Pages:</strong> {page_count}
-                    &nbsp; • &nbsp;
-                    <strong>Chunks:</strong> {len(chunks)}
-                    &nbsp; • &nbsp;
-                    <strong>Text:</strong> {len(full_text):,} characters
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-
-            # -------------------------------------------------
-            # FEATURE TABS
-            # -------------------------------------------------
-
-            qa_tab, summary_tab, quiz_tab, explorer_tab = st.tabs(
-                [
-                    "💬 Q&A",
-                    "📝 Summary",
-                    "🎯 Quiz",
-                    "📖 Document Explorer"
-                ]
-            )
-
-
-            # =================================================
-            # Q&A
-            # =================================================
-
-            with qa_tab:
-
-                st.subheader(
-                    "💬 Ask Your Notes"
-                )
-
-                question = st.text_input(
-                    "Enter your question",
-                    placeholder=(
-                        "Example: What are the advantages "
-                        "of Hash File Organization?"
+                    full_text = extract_text_from_pdf(
+                        uploaded_file
                     )
-                )
 
-                if st.button(
-                    "🔍 Get Answer",
-                    use_container_width=True
-                ):
+                    chunks = create_chunks(
+                        full_text
+                    )
 
-                    if not question.strip():
+                    tfidf_index = create_tfidf_index(
+                        chunks
+                    )
 
-                        st.warning(
-                            "Please enter a question."
-                        )
+                    st.session_state.full_text = full_text
+                    st.session_state.chunks = chunks
+                    st.session_state.tfidf_index = tfidf_index
+                    st.session_state.processed_pdf_id = current_pdf_id
 
-                    else:
+                except Exception as e:
 
-                        with st.spinner(
-                            "Searching your notes..."
-                        ):
+                    st.error(
+                        f"Could not process the PDF: {e}"
+                    )
 
-                            retrieved = retrieve_relevant_chunks(
-                                question,
-                                chunks,
-                                embeddings
-                            )
+                    st.stop()
 
-                            answer = answer_question(
-                                question,
-                                retrieved
-                            )
+        else:
 
-                        st.subheader("💡 Answer")
-
-                        st.write(answer)
-
-                        add_history(
-                            "💬 Question",
-                            question,
-                            answer
-                        )
-
-                        st.subheader(
-                            "📚 Retrieved Sources"
-                        )
-
-                        for i, item in enumerate(
-                            retrieved
-                        ):
-
-                            st.markdown(
-                                f"""
-                                <div class="source-card">
-                                    <strong>
-                                        Source {i + 1}
-                                    </strong>
-                                    <br>
-                                    Similarity:
-                                    {item['score']:.3f}
-                                    <br><br>
-                                    {item['chunk']}
-                                </div>
-                                """,
-                                unsafe_allow_html=True
-                            )
+            full_text = st.session_state.full_text
+            chunks = st.session_state.chunks
+            tfidf_index = st.session_state.tfidf_index
 
 
-            # =================================================
-            # SUMMARY
-            # =================================================
+        # -------------------------------------------------
+        # PDF INFORMATION
+        # -------------------------------------------------
 
-            with summary_tab:
+        st.markdown(
+            f"""
+            <div class="info-card">
+            <b>📄 File:</b> {uploaded_file.name}<br>
+            <b>📑 Pages:</b> {len(PdfReader(uploaded_file).pages)}<br>
+            <b>🧩 Chunks:</b> {len(chunks)}<br>
+            <b>📝 Characters:</b> {len(full_text)}
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
-                st.subheader(
-                    "📝 Study Summary"
-                )
 
-                if st.button(
-                    "✨ Generate Summary",
-                    use_container_width=True
-                ):
+        # -------------------------------------------------
+        # FEATURES
+        # -------------------------------------------------
+
+        feature_tabs = st.tabs(
+            [
+                "💬 Q&A",
+                "📝 Summary",
+                "🎯 Quiz",
+                "📖 Document Explorer"
+            ]
+        )
+
+
+        # =================================================
+        # Q&A
+        # =================================================
+
+        with feature_tabs[0]:
+
+            st.subheader(
+                "💬 Ask Questions From Your Notes"
+            )
+
+            question = st.text_input(
+                "Enter your question",
+                placeholder="Example: What are the advantages of hash file organization?"
+            )
+
+            if st.button(
+                "🔎 Ask Question",
+                key="ask_question"
+            ):
+
+                if not question.strip():
+
+                    st.warning(
+                        "Please enter a question."
+                    )
+
+                else:
 
                     with st.spinner(
-                        "Creating summary..."
+                        "Finding the relevant information..."
                     ):
+
+                        try:
+
+                            retrieved_chunks = retrieve_relevant_chunks(
+                                question,
+                                chunks,
+                                tfidf_index,
+                                top_k=5
+                            )
+
+                            answer = generate_answer(
+                                question,
+                                retrieved_chunks
+                            )
+
+                            st.markdown("### Answer")
+
+                            st.write(answer)
+
+                            add_history(
+                                "💬 Question",
+                                question,
+                                answer
+                            )
+
+                            if retrieved_chunks:
+
+                                st.markdown(
+                                    "### 📚 Sources"
+                                )
+
+                                for item in retrieved_chunks:
+
+                                    st.markdown(
+                                        f"""
+                                        <div class="source-card">
+                                        <b>Chunk {item['index'] + 1}</b>
+                                        &nbsp; | &nbsp;
+                                        Similarity:
+                                        {item['similarity']:.3f}
+                                        <br><br>
+                                        {item['text'][:500]}
+                                        </div>
+                                        """,
+                                        unsafe_allow_html=True
+                                    )
+
+                        except Exception as e:
+
+                            st.error(
+                                f"Could not generate the answer: {e}"
+                            )
+
+
+        # =================================================
+        # SUMMARY
+        # =================================================
+
+        with feature_tabs[1]:
+
+            st.subheader(
+                "📝 Generate Study Summary"
+            )
+
+            if st.button(
+                "📝 Generate Summary",
+                key="generate_summary"
+            ):
+
+                with st.spinner(
+                    "Creating your summary..."
+                ):
+
+                    try:
 
                         summary = generate_summary(
                             full_text
                         )
 
-                    st.markdown(summary)
+                        st.markdown(
+                            "### 📚 Study Summary"
+                        )
 
-                    add_history(
-                        "📝 Summary",
-                        "PDF Summary",
-                        summary
-                    )
+                        st.write(summary)
+
+                        add_history(
+                            "📝 Summary",
+                            "PDF Summary",
+                            summary
+                        )
+
+                    except Exception as e:
+
+                        st.error(
+                            f"Could not generate summary: {e}"
+                        )
 
 
-            # =================================================
-            # QUIZ
-            # =================================================
+        # =================================================
+        # QUIZ
+        # =================================================
 
-            with quiz_tab:
+        with feature_tabs[2]:
 
-                st.subheader(
-                    "🎯 Interactive Quiz"
-                )
+            st.subheader(
+                "🎯 Interactive Quiz"
+            )
 
-                st.write(
-                    "Test your understanding with 5 questions."
-                )
+            # Generate first round
+            if not st.session_state.quiz_questions:
 
-                # Start quiz
-
-                if (
-                    not st.session_state.quiz_questions
-                    and
-                    st.session_state.quiz_round == 0
+                if st.button(
+                    "🎯 Start Quiz",
+                    key="start_quiz"
                 ):
 
-                    if st.button(
-                        "🚀 Start Quiz",
-                        use_container_width=True
+                    with st.spinner(
+                        "Creating your quiz..."
                     ):
 
-                        with st.spinner(
-                            "Generating 5 questions..."
-                        ):
+                        try:
 
-                            try:
+                            questions = generate_quiz(
+                                full_text,
+                                st.session_state.quiz_previous_questions
+                            )
 
-                                questions = generate_quiz(
-                                    full_text,
-                                    st.session_state.quiz_previous_questions
-                                )
-
-                                st.session_state.quiz_questions = questions
-
-                                st.session_state.quiz_current_index = 0
-
-                                st.session_state.quiz_score = 0
-
-                                st.session_state.quiz_answered = False
-
-                                st.session_state.quiz_selected_answer = None
-
-                                st.session_state.quiz_round = 1
-
-                                st.session_state.quiz_history_saved = False
-
-                                st.rerun()
-
-                            except Exception as e:
+                            if not questions:
 
                                 st.error(
-                                    f"Could not generate quiz: {e}"
+                                    "Could not create a valid quiz. Please try again."
                                 )
 
-                # Display quiz
+                            else:
 
-                if st.session_state.quiz_questions:
-
-                    questions = (
-                        st.session_state.quiz_questions
-                    )
-
-                    current_index = (
-                        st.session_state.quiz_current_index
-                    )
-
-                    current_question = questions[
-                        current_index
-                    ]
-
-                    st.progress(
-                        (current_index + 1) / 5
-                    )
-
-                    st.markdown(
-                        f"### Question {current_index + 1} of 5"
-                    )
-
-                    st.write(
-                        f"**{current_question['question']}**"
-                    )
-
-                    options = (
-                        current_question["options"]
-                    )
-
-                    selected = st.radio(
-                        "Choose your answer:",
-                        [
-                            f"A. {options['A']}",
-                            f"B. {options['B']}",
-                            f"C. {options['C']}",
-                            f"D. {options['D']}"
-                        ],
-                        key=f"quiz_option_{current_index}"
-                    )
-
-                    selected_letter = selected[0]
-
-                    # Submit
-
-                    if not st.session_state.quiz_answered:
-
-                        if st.button(
-                            "✅ Submit Answer",
-                            use_container_width=True
-                        ):
-
-                            st.session_state.quiz_selected_answer = (
-                                selected_letter
-                            )
-
-                            if (
-                                selected_letter
-                                ==
-                                current_question[
-                                    "correct_answer"
-                                ]
-                            ):
-
-                                st.session_state.quiz_score += 1
-
-                            st.session_state.quiz_answered = True
-
-                            st.rerun()
-
-                    # Result
-
-                    if st.session_state.quiz_answered:
-
-                        correct_answer = (
-                            current_question[
-                                "correct_answer"
-                            ]
-                        )
-
-                        if (
-                            st.session_state.quiz_selected_answer
-                            ==
-                            correct_answer
-                        ):
-
-                            st.success(
-                                "🎉 Correct answer!"
-                            )
-
-                        else:
-
-                            st.error(
-                                "❌ Incorrect answer."
-                            )
-
-                            st.info(
-                                f"Correct answer: "
-                                f"{correct_answer}. "
-                                f"{options[correct_answer]}"
-                            )
-
-                        st.write(
-                            "**Explanation:**"
-                        )
-
-                        st.write(
-                            current_question[
-                                "explanation"
-                            ]
-                        )
-
-                        # Next question
-
-                        if current_index < 4:
-
-                            if st.button(
-                                "➡️ Next Question",
-                                use_container_width=True
-                            ):
-
-                                st.session_state.quiz_current_index += 1
-
+                                st.session_state.quiz_questions = questions
+                                st.session_state.quiz_current_index = 0
+                                st.session_state.quiz_score = 0
                                 st.session_state.quiz_answered = False
-
                                 st.session_state.quiz_selected_answer = None
+                                st.session_state.quiz_round += 1
 
                                 st.rerun()
 
-                        # Quiz complete
+                        except Exception as e:
 
-                        else:
-
-                            percentage = (
-                                st.session_state.quiz_score
-                                / 5
-                            ) * 100
-
-                            st.markdown(
-                                f"""
-                                <div class="score-card">
-                                    <h2>🏆 Quiz Complete!</h2>
-                                    <h3>
-                                        Score:
-                                        {st.session_state.quiz_score}/5
-                                    </h3>
-                                    <h3>
-                                        Percentage:
-                                        {percentage:.0f}%
-                                    </h3>
-                                </div>
-                                """,
-                                unsafe_allow_html=True
+                            st.error(
+                                f"Could not generate quiz: {e}"
                             )
 
-                            if not st.session_state.quiz_history_saved:
 
-                                for q in questions:
+            # Quiz in progress
+            elif (
+                st.session_state.quiz_current_index
+                <
+                len(st.session_state.quiz_questions)
+            ):
 
-                                    st.session_state.quiz_previous_questions.append(
-                                        q["question"]
-                                    )
+                current_index = (
+                    st.session_state.quiz_current_index
+                )
 
-                                add_history(
-                                    "🎯 Quiz",
-                                    f"Quiz Round "
-                                    f"{st.session_state.quiz_round}",
-                                    (
-                                        f"Score: "
-                                        f"{st.session_state.quiz_score}/5 "
-                                        f"({percentage:.0f}%)"
-                                    )
-                                )
-
-                                st.session_state.quiz_history_saved = True
-
-                            if st.button(
-                                "🔄 Next 5 Questions",
-                                use_container_width=True
-                            ):
-
-                                with st.spinner(
-                                    "Generating new questions..."
-                                ):
-
-                                    try:
-
-                                        new_questions = generate_quiz(
-                                            full_text,
-                                            st.session_state.quiz_previous_questions
-                                        )
-
-                                        st.session_state.quiz_questions = (
-                                            new_questions
-                                        )
-
-                                        st.session_state.quiz_current_index = 0
-
-                                        st.session_state.quiz_score = 0
-
-                                        st.session_state.quiz_answered = False
-
-                                        st.session_state.quiz_selected_answer = None
-
-                                        st.session_state.quiz_round += 1
-
-                                        st.session_state.quiz_history_saved = False
-
-                                        st.rerun()
-
-                                    except Exception as e:
-
-                                        st.error(
-                                            f"Could not generate quiz: {e}"
-                                        )
-
-
-            # =================================================
-            # DOCUMENT EXPLORER
-            # =================================================
-
-            with explorer_tab:
-
-                st.subheader(
-                    "📖 Document Explorer"
+                current_question = (
+                    st.session_state.quiz_questions[
+                        current_index
+                    ]
                 )
 
                 st.write(
-                    "Explore the chunks created from your PDF."
+                    f"### Question {current_index + 1} of 5"
                 )
 
-                st.info(
-                    f"This document contains "
-                    f"{len(chunks)} chunks."
+                st.write(
+                    current_question["question"]
                 )
 
-                selected_chunk = st.number_input(
-                    "Select chunk number",
-                    min_value=1,
-                    max_value=len(chunks),
-                    value=1
+                selected_answer = st.radio(
+                    "Choose your answer:",
+                    options=[
+                        "A",
+                        "B",
+                        "C",
+                        "D"
+                    ],
+                    format_func=lambda option:
+                        f"{option}. {current_question['options'][option]}",
+                    key=f"quiz_option_{current_index}"
                 )
 
-                chunk_index = (
-                    selected_chunk - 1
+                if not st.session_state.quiz_answered:
+
+                    if st.button(
+                        "✅ Submit Answer",
+                        key=f"submit_{current_index}"
+                    ):
+
+                        st.session_state.quiz_selected_answer = selected_answer
+                        st.session_state.quiz_answered = True
+
+                        if (
+                            selected_answer
+                            ==
+                            current_question["correct_answer"]
+                        ):
+
+                            st.session_state.quiz_score += 1
+
+                        st.rerun()
+
+                else:
+
+                    correct_answer = (
+                        current_question[
+                            "correct_answer"
+                        ]
+                    )
+
+                    if (
+                        st.session_state.quiz_selected_answer
+                        ==
+                        correct_answer
+                    ):
+
+                        st.success(
+                            "✅ Correct!"
+                        )
+
+                    else:
+
+                        st.error(
+                            "❌ Incorrect!"
+                        )
+
+                        st.info(
+                            f"Correct answer: "
+                            f"**{correct_answer}. "
+                            f"{current_question['options'][correct_answer]}**"
+                        )
+
+                    st.write(
+                        f"**Explanation:** "
+                        f"{current_question['explanation']}"
+                    )
+
+                    if st.button(
+                        "➡️ Next Question",
+                        key=f"next_{current_index}"
+                    ):
+
+                        st.session_state.quiz_current_index += 1
+                        st.session_state.quiz_answered = False
+                        st.session_state.quiz_selected_answer = None
+
+                        st.rerun()
+
+
+            # Quiz completed
+            else:
+
+                score = st.session_state.quiz_score
+
+                percentage = (
+                    score / 5
+                ) * 100
+
+                st.success(
+                    f"🎉 Quiz Complete!"
                 )
 
-                st.markdown(
-                    f"""
-                    <div class="source-card">
-                        <strong>
-                            Chunk {selected_chunk}
-                        </strong>
-                        <br><br>
-                        {chunks[chunk_index]}
-                    </div>
-                    """,
-                    unsafe_allow_html=True
+                st.write(
+                    f"### Score: {score}/5"
                 )
 
-        except Exception as e:
+                st.write(
+                    f"### Percentage: {percentage:.0f}%"
+                )
 
-            st.error(
-                f"Could not process the PDF: {e}"
+                add_history(
+                    "🎯 Quiz",
+                    f"Quiz Round {st.session_state.quiz_round}",
+                    f"Score: {score}/5 ({percentage:.0f}%)"
+                )
+
+                st.divider()
+
+                if st.button(
+                    "🔄 Next 5 Questions",
+                    key="next_quiz_round"
+                ):
+
+                    for question in (
+                        st.session_state.quiz_questions
+                    ):
+
+                        st.session_state.quiz_previous_questions.append(
+                            question["question"]
+                        )
+
+                    st.session_state.quiz_questions = []
+                    st.session_state.quiz_current_index = 0
+                    st.session_state.quiz_score = 0
+                    st.session_state.quiz_answered = False
+                    st.session_state.quiz_selected_answer = None
+
+                    st.rerun()
+
+
+        # =================================================
+        # DOCUMENT EXPLORER
+        # =================================================
+
+        with feature_tabs[3]:
+
+            st.subheader(
+                "📖 Document Explorer"
+            )
+
+            st.write(
+                f"This document contains "
+                f"**{len(chunks)} chunks**."
+            )
+
+            selected_chunk = st.selectbox(
+                "Select a chunk",
+                range(len(chunks)),
+                format_func=lambda x:
+                    f"Chunk {x + 1}"
+            )
+
+            st.markdown(
+                f"""
+                <div class="source-card">
+                <b>Chunk {selected_chunk + 1}</b>
+                <br><br>
+                {chunks[selected_chunk]}
+                </div>
+                """,
+                unsafe_allow_html=True
             )
 
 
@@ -1217,40 +1310,35 @@ with pdf_mode:
 # STUDY WITHOUT PDF
 # =========================================================
 
-with topic_mode:
+with tab_without_pdf:
 
-    st.header(
-        "📚 Study Without PDF"
+    st.subheader(
+        "📚 Study Without a PDF"
     )
 
     st.write(
-        "Don't have notes or a PDF? "
-        "Enter your subject and topic, then choose what you want to learn."
+        "Don't have notes or a PDF? Enter your subject "
+        "and topic, then choose what you want to learn."
     )
 
     st.warning(
         "For specific language or literature lessons, "
-        "your textbook or PDF is recommended because the exact context matters."
+        "your textbook or PDF is recommended because "
+        "the exact context matters."
     )
 
-    col1, col2 = st.columns(2)
+    subject = st.text_input(
+        "Subject",
+        placeholder="Example: DBMS / Kannada / English"
+    )
 
-    with col1:
-
-        subject = st.text_input(
-            "Subject",
-            placeholder="Example: DBMS"
-        )
-
-    with col2:
-
-        topic = st.text_input(
-            "Topic / Lesson",
-            placeholder="Example: File Organization"
-        )
+    topic = st.text_input(
+        "Topic / Lesson",
+        placeholder="Example: File Organization"
+    )
 
     study_type = st.selectbox(
-        "What do you want to study?",
+        "What do you want to learn?",
         [
             "Simple Explanation",
             "Exam Preparation",
@@ -1261,8 +1349,8 @@ with topic_mode:
     )
 
     if st.button(
-        "📚 Start Studying",
-        use_container_width=True
+        "📚 Study Topic",
+        key="study_topic"
     ):
 
         if not subject.strip():
@@ -1283,35 +1371,31 @@ with topic_mode:
                 "Preparing your study material..."
             ):
 
-                lesson = generate_topic_lesson(
-                    subject,
-                    topic,
-                    study_type
-                )
+                try:
 
-            st.write(
-                f"**Subject:** {subject}"
-            )
+                    lesson = generate_topic_lesson(
+                        subject,
+                        topic,
+                        study_type
+                    )
 
-            st.write(
-                f"**Topic:** {topic}"
-            )
+                    st.markdown(
+                        "### 📚 Study Material"
+                    )
 
-            st.write(
-                f"**Study mode:** {study_type}"
-            )
+                    st.write(lesson)
 
-            st.divider()
+                    add_history(
+                        "📚 Topic Study",
+                        topic,
+                        lesson
+                    )
 
-            st.markdown(
-                lesson
-            )
+                except Exception as e:
 
-            add_history(
-                "📚 Topic Study",
-                topic,
-                lesson
-            )
+                    st.error(
+                        f"Could not generate study material: {e}"
+                    )
 
 
 # =========================================================
@@ -1321,6 +1405,5 @@ with topic_mode:
 st.divider()
 
 st.caption(
-    "📚 StudyMate RAG • "
-    "Learn from your notes. Understand better. Revise smarter."
+    "StudyMate RAG • Learn smarter. Revise faster. 🎓"
 )

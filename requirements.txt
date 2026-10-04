@@ -1,4 +1,4 @@
 streamlit
 pypdf
-sentence-transformers
 google-genai
+numpy
