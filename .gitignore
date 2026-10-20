@@ -2,3 +2,17 @@
 venv/
 __pycache__/
 *.pyc
+# Local databases and backups
+*.db
+*.db-*
+app_new_backup.py
+app_new_before_upgrade.py
+
+# Local study files and downloaded papers
+studymate_data/
+question_papers/
+
+# Local environment files
+.env
+.env.*
+!.env.example

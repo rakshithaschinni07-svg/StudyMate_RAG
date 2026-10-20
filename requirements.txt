@@ -1,4 +1,7 @@
-streamlit
-pypdf
-google-genai
-numpy
+streamlit>=1.35.0
+pypdf>=4.2.0
+google-genai>=1.0.0
+scikit-learn>=1.4.0
+ddgs>=9.0.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
