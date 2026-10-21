@@ -1,8 +1,13 @@
+import time
 import os
 import re
 import io
 import json
 import sqlite3
+
+import pymupdf
+import pytesseract
+from PIL import Image
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, urljoin, unquote
@@ -38,15 +43,41 @@ PAPER_FOLDER = Path("question_papers")
 
 MODEL_NAME = os.getenv(
     "GEMINI_MODEL",
-    "gemini-2.5-flash"
+    "gemini-3.6-flash"
 )
-FALLBACK_MODELS = ["gemini-2.5-flash"]
 
+FALLBACK_MODELS = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.7-flash",
+]
 LANGUAGES = [
     "English", "Kannada", "Hindi", "Tamil", "Telugu",
     "Marathi", "Urdu", "Odia", "Punjabi", "Gujarati",
     "Bengali", "Malayalam"
 ]
+
+# OCR configuration (Tesseract must be installed on this computer).
+TESSERACT_EXE = os.getenv(
+    "TESSERACT_CMD",
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+)
+if os.path.exists(TESSERACT_EXE):
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_EXE
+
+OCR_LANGUAGES = {
+    "English": "eng",
+    "Kannada": "kan",
+    "Hindi": "hin",
+    "Tamil": "tam",
+    "Telugu": "tel",
+    "Marathi": "mar",
+    "Urdu": "urd",
+    "Odia": "ori",
+    "Punjabi": "pan",
+    "Gujarati": "guj",
+    "Bengali": "ben",
+    "Malayalam": "mal",
+}
 
 EDUCATION_LEVELS = [
     "School",
@@ -127,37 +158,64 @@ def ask_ai(prompt):
         if model != MODEL_NAME
     ]
 
+    
     errors = []
 
     for model_name in models:
-        try:
-            client = genai.Client(
-                api_key=api_key,
-                http_options={"timeout": 60000}
-            )
+        for attempt in range(2):
+            try:
+                client = genai.Client(
+                    api_key=api_key,
+                    http_options={"timeout": 180000}
+                )
 
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt
-            )
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt
+                )
 
-            result = getattr(response, "text", None)
+                result = getattr(response, "text", None)
 
-            if result and result.strip():
-                return result.strip()
+                if result and result.strip():
+                    return result.strip()
 
-            errors.append(f"{model_name}: Empty response")
+                errors.append(
+                    f"{model_name}: Empty response"
+                )
+                break
 
-        except Exception as exc:
-            errors.append(
-                f"{model_name}: {str(exc)[:200]}"
-            )
+            except Exception as exc:
+                message = str(exc)
+
+                errors.append(
+                    f"{model_name}, attempt {attempt + 1}: "
+                    f"{message[:200]}"
+                )
+
+                temporary = any(
+                    term in message.upper()
+                    for term in (
+                        "503",
+                        "504",
+                        "UNAVAILABLE",
+                        "DEADLINE_EXCEEDED",
+                        "429",
+                        "RESOURCE_EXHAUSTED"
+                    )
+                )
+
+                if temporary and attempt == 0:
+                    time.sleep(2)
+                    continue
+
+                break
 
     return (
-        "ERROR: Could not generate a response. Check your API key, "
-        "model access, internet connection, or API quota.\n\n"
+        "ERROR: Gemini could not respond after retries. "
+        "Check model availability, API quota, and internet connection.\n\n"
         + "\n".join(errors)
     )
+
 
 
 def is_error(text):
@@ -275,6 +333,16 @@ def load_quiz_results():
             ORDER BY id DESC
             LIMIT 50
         """).fetchall()
+
+
+def clear_history():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM study_history")
+
+
+def clear_quiz_results():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM quiz_results")
 
 
 # =========================================================
@@ -498,6 +566,67 @@ def save_online_result(result, subject, course, university, year):
     )
 
 
+def rank_paper_results(results, subject, course, university, year):
+    """Rank search results by relevance; this does not verify authenticity."""
+    import re
+    from urllib.parse import urlparse
+
+    def words(value):
+        return set(re.findall(r"[a-z0-9]+", str(value).lower()))
+
+    subject_words = words(subject)
+    course_words = words(course)
+    university_words = words(university)
+
+    ranked = []
+
+    for result in results:
+        title = result.get("title", "")
+        snippet = result.get("snippet", "")
+        url = result.get("url", "")
+        text = f"{title} {snippet} {urlparse(url).netloc}".lower()
+        text_words = words(text)
+
+        score = 0
+
+        # Subject is essential: reward exact subject terms.
+        if subject_words:
+            matched = subject_words & text_words
+            score += 5 * len(matched) / len(subject_words)
+
+            # Common abbreviations and full subject names.
+            aliases = {
+                "cn": ["computer networks", "computer network"],
+                "dbms": ["database management systems", "database management"],
+                "os": ["operating systems", "operating system"],
+            }
+            for alias in aliases.get(subject.lower().strip(), []):
+                if alias in text:
+                    score += 5
+
+        # Course and university matches.
+        if course_words:
+            score += 4 * len(course_words & text_words) / len(course_words)
+
+        if university_words:
+            score += 4 * len(university_words & text_words) / len(university_words)
+
+        # Reward a requested year only when it appears in the result text.
+        if str(year).isdigit() and str(year) in text:
+            score += 3
+
+        # Prefer likely paper/PDF results.
+        if "question paper" in text or "question papers" in text:
+            score += 2
+        if ".pdf" in url.lower() or "pdf" in title.lower():
+            score += 1
+
+        ranked.append((score, result))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [result for _, result in ranked]
+
+
 # =========================================================
 # DOWNLOAD AND VERIFY ONLINE QUESTION-PAPER PDFs
 # =========================================================
@@ -597,8 +726,8 @@ def save_downloaded_paper_pdf(pdf_bytes, title, level, board, course, exam, subj
             file_path=str(destination),
         )
     except Exception:
-        destination.unlink(missing_ok=True)
-        raise
+             destination.unlink(missing_ok=True)
+             raise
     return str(destination)
 
 
@@ -741,22 +870,54 @@ def clear_mode_results():
 # PDF EXTRACTION
 # =========================================================
 
-def extract_pdf(uploaded_file):
+def extract_pdf(uploaded_file, ocr_languages=None):
+    """Extract selectable PDF text and OCR scanned pages when needed."""
+    if ocr_languages is None:
+        ocr_languages = ["eng"]
+
+    allowed_codes = set(OCR_LANGUAGES.values())
+    selected_codes = [code for code in ocr_languages if code in allowed_codes]
+    if not selected_codes:
+        selected_codes = ["eng"]
+    language_string = "+".join(selected_codes)
+
     try:
         pdf_bytes = uploaded_file.getvalue()
-        reader = PdfReader(io.BytesIO(pdf_bytes))
         pages = []
 
-        for index, page in enumerate(reader.pages):
-            try:
-                text = page.extract_text() or ""
-            except Exception:
-                text = ""
+        with pymupdf.open(stream=pdf_bytes, filetype="pdf") as document:
+            for index, page in enumerate(document):
+                try:
+                    text = (page.get_text("text") or "").strip()
+                except Exception:
+                    text = ""
 
-            pages.append({
-                "page": index + 1,
-                "text": text.strip()
-            })
+                ocr_used = False
+                # OCR only when normal extraction found no selectable text.
+                if not text:
+                    try:
+                        pix = page.get_pixmap(
+                            matrix=pymupdf.Matrix(2, 2),
+                            alpha=False
+                        )
+                        image = Image.frombytes(
+                            "RGB", (pix.width, pix.height), pix.samples
+                        )
+                        text = pytesseract.image_to_string(
+                            image,
+                            lang=language_string,
+                            config="--oem 1 --psm 3"
+                        ).strip()
+                        ocr_used = True
+                    except Exception as ocr_exc:
+                        print(f"OCR failed on PDF page {index + 1}: {ocr_exc}")
+                        text = ""
+
+                pages.append({
+                    "page": index + 1,
+                    "text": text,
+                    "ocr_used": ocr_used,
+                })
 
         return pages
 
@@ -1305,21 +1466,36 @@ if st.session_state.study_mode == "Study With PDF":
         "Choose a PDF file",
         type=["pdf"],
         key="main_page_pdf",
-        help="Upload a PDF containing selectable text for best results."
+        help="Upload a PDF. Scanned pages can be read using OCR; select the languages below."
     )
 
     if uploaded_file is not None:
+        ocr_language_names = st.multiselect(
+            "OCR languages for scanned pages",
+            options=list(OCR_LANGUAGES.keys()),
+            default=["English", "Kannada"],
+            help="Choose the languages printed in scanned/image-based pages.",
+            key="ocr_languages_selected",
+        )
+        ocr_language_codes = [
+            OCR_LANGUAGES[name] for name in ocr_language_names
+        ]
+        pdf_bytes = uploaded_file.getvalue()
         signature = (
             f"{uploaded_file.name}-"
             f"{uploaded_file.size}-"
-            f"{hash(uploaded_file.getvalue())}"
+            f"{hash(pdf_bytes)}-"
+            f"{','.join(ocr_language_codes)}"
         )
 
         if signature != st.session_state.pdf_signature:
             with st.spinner(
                 "Reading your PDF and preparing study notes..."
             ):
-                pages = extract_pdf(uploaded_file)
+                pages = extract_pdf(
+                    uploaded_file,
+                    ocr_languages=ocr_language_codes,
+                )
                 chunks = create_chunks(pages)
 
                 st.session_state.pages = pages
@@ -1347,6 +1523,16 @@ if st.session_state.study_mode == "Study With PDF":
             col3.metric("Text chunks", len(st.session_state.chunks))
 
             st.success(f"Loaded: {st.session_state.filename}")
+
+            ocr_pages = [
+                page["page"] for page in st.session_state.pages
+                if page.get("ocr_used", False)
+            ]
+            if ocr_pages:
+                st.info(
+                    "OCR was used on page(s): "
+                    + ", ".join(map(str, ocr_pages))
+                )
 
             if readable_pages < len(st.session_state.pages):
                 st.warning(
@@ -1971,6 +2157,7 @@ with tab_map["📚 Previous Question Papers"]:
             use_container_width=True
         )
 
+    
     if online_search_button:
         if not any([
             online_subject.strip(),
@@ -1980,6 +2167,9 @@ with tab_map["📚 Previous Question Papers"]:
             st.warning(
                 "Enter at least a subject, course, or university."
             )
+            st.session_state.online_paper_results = []
+            st.session_state.online_paper_search_query = ""
+            st.session_state.online_paper_search_error = ""
         else:
             query = make_paper_search_query(
                 online_subject,
@@ -1997,103 +2187,212 @@ with tab_map["📚 Previous Question Papers"]:
                     max_results=10
                 )
 
+                if not error and results:
+                    results = rank_paper_results(
+                        results,
+                        online_subject,
+                        online_course,
+                        online_university,
+                        online_year
+                    )
+
             st.session_state.online_paper_results = results
             st.session_state.online_paper_search_error = error
+
+    # -----------------------------------------------------
+    # DISPLAY SEARCH STATUS AND RESULTS
+    # -----------------------------------------------------
 
     if st.session_state.online_paper_search_error:
         st.error(st.session_state.online_paper_search_error)
 
-    if st.session_state.online_paper_results:
+    results = st.session_state.online_paper_results
+
+    if results:
         st.markdown("#### Search Results")
 
-        st.caption(
-            f"Search query: {st.session_state.online_paper_search_query}"
+        inferred_year = (
+            int(online_year)
+            if online_year.isdigit()
+            else current_year
         )
 
-        st.warning(
-            "These are web search results. A result may be a webpage, "
-            "a PDF, or an unrelated page. Verify it before saving."
+        inferred_type = (
+            online_type
+            if online_type != "Any paper type"
+            else "Previous Year Question Paper"
         )
 
-        for index, result in enumerate(
-            st.session_state.online_paper_results
-        ):
+        inferred_level = (
+            "Competitive Exam"
+            if any(
+                word in (
+                    online_course + " " + online_subject
+                ).lower()
+                for word in [
+                    "jee", "neet", "upsc", "competitive", "gate"
+                ]
+            )
+            else "Degree / University"
+        )
+
+        for index, result in enumerate(results):
             with st.container(border=True):
-                st.markdown(f"**{index + 1}. {result['title']}**")
+                st.markdown(
+                    f"**{index + 1}. {result['title']}**"
+                )
 
-                if result["snippet"]:
+                if result.get("snippet"):
                     st.write(result["snippet"])
 
                 st.markdown(
                     f"[🔗 Open source website]({result['url']})"
                 )
 
-                save_col1, save_col2 = st.columns([1, 1])
-                inferred_year = int(online_year) if online_year.isdigit() else current_year
-                inferred_type = online_type if online_type != "Any paper type" else "Previous Year Question Paper"
-                inferred_level = (
-                    "Competitive Exam"
-                    if any(word in (online_course + " " + online_subject).lower() for word in ["jee", "neet", "upsc", "competitive", "gate"])
-                    else "Degree / University"
-                )
+                save_col1, save_col2 = st.columns(2)
 
                 with save_col1:
-                    if st.button("💾 Save source link", key=f"save_online_paper_{index}", use_container_width=True):
+                    if st.button(
+                        "💾 Save source link",
+                        key=f"save_online_paper_{index}",
+                        use_container_width=True
+                    ):
                         try:
                             with sqlite3.connect(DB_PATH) as conn:
-                                existing = conn.execute("SELECT id FROM question_papers WHERE source_url = ? LIMIT 1", (result["url"],)).fetchone()
+                                existing = conn.execute(
+                                    """
+                                    SELECT id FROM question_papers
+                                    WHERE source_url = ?
+                                    LIMIT 1
+                                    """,
+                                    (result["url"],)
+                                ).fetchone()
+
                             if existing:
-                                st.info("This source is already in your library.")
+                                st.info(
+                                    "This source is already in your library."
+                                )
                             else:
                                 add_question_paper(
-                                    title=result["title"], education_level=inferred_level,
-                                    board_university=online_university.strip() or "Not specified",
-                                    class_course=online_course.strip() or "Not specified",
-                                    exam_name="Question Paper", subject=online_subject.strip() or "Not specified",
-                                    year=inferred_year, paper_type=inferred_type,
-                                    source_url=result["url"], file_path=""
+                                    title=result["title"],
+                                    education_level=inferred_level,
+                                    board_university=(
+                                        online_university.strip()
+                                        or "Not specified"
+                                    ),
+                                    class_course=(
+                                        online_course.strip()
+                                        or "Not specified"
+                                    ),
+                                    exam_name="Question Paper",
+                                    subject=(
+                                        online_subject.strip()
+                                        or "Not specified"
+                                    ),
+                                    year=inferred_year,
+                                    paper_type=inferred_type,
+                                    source_url=result["url"],
+                                    file_path=""
                                 )
-                                st.success("Source link saved. Use Download PDF to store a verified PDF file.")
+
+                                st.success(
+                                    "Source link saved. Use Find & download "
+                                    "PDF to store a verified PDF file."
+                                )
+
                         except Exception as exc:
-                            st.error(f"Could not save this result: {exc}")
+                            st.error(
+                                f"Could not save this result: {exc}"
+                            )
 
                 with save_col2:
-                    if st.button("⬇️ Find & download PDF", key=f"download_online_paper_{index}", use_container_width=True):
-                        with st.spinner("Checking the result page for a real PDF..."):
-                            candidates = discover_pdf_links(result["url"], result["title"])
+                    if st.button(
+                        "⬇️ Find & download PDF",
+                        key=f"download_online_paper_{index}",
+                        use_container_width=True
+                    ):
+                        with st.spinner(
+                            "Checking the result page for a real PDF..."
+                        ):
+                            candidates = discover_pdf_links(
+                                result["url"],
+                                result["title"]
+                            )
+
                             downloaded = None
                             final_source = ""
-                            last_error = "No PDF links were found on this page."
+                            last_error = (
+                                "No PDF links were found on this page."
+                            )
+
                             for candidate in candidates:
-                                data, outcome = _download_candidate_pdf(candidate)
+                                data, outcome = _download_candidate_pdf(
+                                    candidate
+                                )
+
                                 if data:
-                                    downloaded, final_source = data, outcome
+                                    downloaded = data
+                                    final_source = outcome
                                     break
+
                                 last_error = outcome
+
                         if not downloaded:
-                            st.warning(f"No valid downloadable PDF was found. {last_error}")
+                            st.warning(
+                                "No valid downloadable PDF was found. "
+                                f"{last_error}"
+                            )
                         else:
                             try:
                                 with sqlite3.connect(DB_PATH) as conn:
-                                    existing = conn.execute("SELECT id FROM question_papers WHERE source_url = ? LIMIT 1", (final_source,)).fetchone()
+                                    existing = conn.execute(
+                                        """
+                                        SELECT id FROM question_papers
+                                        WHERE source_url = ?
+                                        LIMIT 1
+                                        """,
+                                        (final_source,)
+                                    ).fetchone()
+
                                 if existing:
-                                    st.info("This PDF source is already in your library.")
+                                    st.info(
+                                        "This PDF source is already "
+                                        "in your library."
+                                    )
                                 else:
                                     saved = save_downloaded_paper_pdf(
-                                        downloaded, result["title"], inferred_level,
-                                        online_university.strip() or "Not specified",
-                                        online_course.strip() or "Not specified", "Question Paper",
-                                        online_subject.strip() or "Not specified", inferred_year,
-                                        inferred_type, final_source
+                                        downloaded,
+                                        result["title"],
+                                        inferred_level,
+                                        online_university.strip()
+                                        or "Not specified",
+                                        online_course.strip()
+                                        or "Not specified",
+                                        "Question Paper",
+                                        online_subject.strip()
+                                        or "Not specified",
+                                        inferred_year,
+                                        inferred_type,
+                                        final_source
                                     )
-                                    st.success(f"Verified PDF downloaded and saved: {Path(saved).name}")
+
+                                    st.success(
+                                        "Verified PDF downloaded and saved: "
+                                        f"{Path(saved).name}"
+                                    )
+
                                     st.download_button(
-                                        "Download this PDF now", data=downloaded,
-                                        file_name=Path(saved).name, mime="application/pdf",
+                                        "Download this PDF now",
+                                        data=downloaded,
+                                        file_name=Path(saved).name,
+                                        mime="application/pdf",
                                         key=f"download_verified_pdf_{index}"
                                     )
+
                             except Exception as exc:
-                                st.error(f"Could not save the PDF: {exc}")
+                                st.error(
+                                    f"Could not save the PDF: {exc}"
+                                )
 
     elif (
         st.session_state.online_paper_search_query
@@ -2105,6 +2404,7 @@ with tab_map["📚 Previous Question Papers"]:
         )
 
     st.divider()
+
 
     # -----------------------------------------------------
     # MANUALLY ADD A PAPER
@@ -2470,35 +2770,60 @@ if "🔁 Repeated Questions" in tab_map:
 with tab_map["📊 History"]:
     st.subheader("📊 Study History")
 
+    with st.expander("🗑️ Clear Study History"):
+        st.warning("This permanently deletes study history.")
+        confirm_history = st.checkbox(
+            "I confirm clearing study history",
+            key="confirm_clear_history"
+        )
+
+        if st.button("Clear Study History", key="clear_history_btn"):
+            if confirm_history:
+                clear_history()
+                st.success("Study history cleared.")
+                st.rerun()
+            else:
+                st.warning("Please tick the confirmation box first.")
+
     history = load_history()
 
     if history:
         for item in history:
             created_at, mode, activity, question, answer = item
 
-            with st.expander(
-                f"{created_at} · {activity} · {mode}"
-            ):
+            with st.expander(f"{created_at} · {activity} · {mode}"):
                 st.markdown(f"**Question or topic:** {question}")
                 st.markdown(answer)
-
     else:
         st.info("Your study activity will appear here.")
 
     st.divider()
     st.subheader("Quiz Progress")
 
+    with st.expander("🗑️ Clear Quiz Attempts"):
+        st.warning("This permanently deletes quiz results.")
+        confirm_quiz = st.checkbox(
+            "I confirm clearing quiz attempts",
+            key="confirm_clear_quiz"
+        )
+
+        if st.button("Clear Quiz Attempts", key="clear_quiz_btn"):
+            if confirm_quiz:
+                clear_quiz_results()
+                st.success("Quiz attempts cleared.")
+                st.rerun()
+            else:
+                st.warning("Please tick the confirmation box first.")
+
     quiz_results = load_quiz_results()
 
     if quiz_results:
         for created_at, topic, score, total in quiz_results:
             percentage = score / total * 100 if total else 0
-
             st.write(
                 f"**{topic}** — {score}/{total} "
                 f"({percentage:.0f}%) · {created_at}"
             )
-
     else:
         st.info("Your quiz results will appear here.")
 
