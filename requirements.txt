@@ -5,3 +5,5 @@ pytesseract
 Pillow
 google-genai
 scikit-learn
+numpy
+beautifulsoup4
